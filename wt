@@ -122,6 +122,10 @@ cmd_new() {
     info "Creating worktree at: $target_path"
     git worktree add -b "$name" "$target_path" "$BASE_BRANCH"
 
+    # Push the branch to remote and set up tracking
+    info "Pushing branch to origin..."
+    git -C "$target_path" push -u origin "$name"
+
     # Copy .env if it exists in repo root and not in target
     local env_source="${repo_root}/.env"
     local env_target="${target_path}/.env"
