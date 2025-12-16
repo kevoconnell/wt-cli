@@ -180,18 +180,22 @@ cmd_rm() {
         die "worktree not found at: $target_path"
     fi
 
+    # Get the branch name from git worktree list (it's in brackets, may differ from folder name)
+    local branch_name
+    branch_name=$(git worktree list --porcelain | grep -A2 "worktree $target_path$" | grep "^branch " | sed 's/^branch refs\/heads\///')
+
     # Remove the worktree
     info "Removing worktree at: $target_path"
     git worktree remove "$target_path"
 
-    # Try to delete the local branch
-    if branch_exists "$name"; then
-        info "Deleting local branch: $name"
+    # Try to delete the local branch using the actual branch name
+    if [[ -n "$branch_name" ]] && branch_exists "$branch_name"; then
+        info "Deleting local branch: $branch_name"
 
         # Try safe delete first (-d), fall back to force delete (-D) if unmerged
-        if ! git branch -d "$name" 2>/dev/null; then
+        if ! git branch -d "$branch_name" 2>/dev/null; then
             info "Warning: branch has unmerged changes, force deleting..."
-            git branch -D "$name"
+            git branch -D "$branch_name"
         fi
     fi
 
@@ -204,19 +208,97 @@ cmd_rm() {
 # ------------------------------------------------------------------------------
 # Command: ls
 # ------------------------------------------------------------------------------
-# List all worktrees
+# List all worktrees with interactive selection via fzf
 cmd_ls() {
-    git worktree list
+    # Check if fzf is available
+    if ! command -v fzf &>/dev/null; then
+        # Fallback to plain list if fzf not installed
+        git worktree list
+        return
+    fi
+
+    # Get worktree list and let user select one
+    local selected
+    selected=$(git worktree list | fzf --height=40% --reverse --header="Select a worktree to navigate to (ESC to cancel)")
+
+    # If user cancelled (ESC), exit gracefully
+    if [[ -z "$selected" ]]; then
+        return 0
+    fi
+
+    # Extract the path (first column of the output)
+    local wt_path
+    wt_path=$(echo "$selected" | awk '{print $1}')
+
+    # Print the path for shell integration
+    # Users should set up: wtls() { cd "$(wt ls)" }
+    echo "$wt_path"
 }
 
 # ------------------------------------------------------------------------------
 # Command: prune
 # ------------------------------------------------------------------------------
-# Prune stale worktree metadata
+# Remove all worktrees except the main repository
 cmd_prune() {
-    info "Pruning stale worktree metadata..."
-    git worktree prune --verbose
-    info "Done."
+    local repo_root
+    repo_root="$(get_repo_root)"
+
+    local wt_base
+    wt_base="$(get_wt_base "$repo_root")"
+
+    local current_dir
+    current_dir="$(pwd)"
+
+    # Check if we're inside a worktree (not the main repo)
+    if [[ "$current_dir" == "$wt_base"* ]]; then
+        die "cannot prune while inside a worktree. Please cd to the main repo first."
+    fi
+
+    # Get all worktrees except the main one
+    local worktrees=()
+    while IFS= read -r line; do
+        local wt_path
+        wt_path=$(echo "$line" | awk '{print $1}')
+        # Skip the main repo
+        if [[ "$wt_path" != "$repo_root" ]]; then
+            worktrees+=("$wt_path")
+        fi
+    done < <(git worktree list)
+
+    if [[ ${#worktrees[@]} -eq 0 ]]; then
+        info "No worktrees to remove."
+        return 0
+    fi
+
+    info "Found ${#worktrees[@]} worktree(s) to remove:"
+    for wt in "${worktrees[@]}"; do
+        info "  - $wt"
+    done
+    info ""
+
+    # Remove each worktree
+    for wt_path in "${worktrees[@]}"; do
+        local wt_name="${wt_path:t}"
+
+        # Get the branch name from git worktree list (it's in brackets)
+        local branch_name
+        branch_name=$(git worktree list --porcelain | grep -A2 "worktree $wt_path$" | grep "^branch " | sed 's/^branch refs\/heads\///')
+
+        info "Removing worktree: $wt_name"
+        git worktree remove "$wt_path" --force 2>/dev/null || true
+
+        # Try to delete the local branch using the actual branch name
+        if [[ -n "$branch_name" ]] && branch_exists "$branch_name"; then
+            info "Deleting local branch: $branch_name"
+            git branch -D "$branch_name" 2>/dev/null || true
+        fi
+    done
+
+    # Clean up stale metadata
+    git worktree prune
+
+    info ""
+    info "All worktrees removed. Only main repository remains."
 }
 
 # ------------------------------------------------------------------------------
@@ -245,6 +327,76 @@ cmd_cd() {
 }
 
 # ------------------------------------------------------------------------------
+# Command: setup
+# ------------------------------------------------------------------------------
+# Set up wt with all dependencies and shell integration
+cmd_setup() {
+    info "Setting up wt - Git Worktree Manager..."
+    info ""
+
+    # Check for Homebrew
+    if ! command -v brew &>/dev/null; then
+        die "Homebrew is required but not installed. Install it from https://brew.sh"
+    fi
+
+    # Install fzf if not present
+    if ! command -v fzf &>/dev/null; then
+        info "Installing fzf..."
+        brew install fzf
+    else
+        info "fzf is already installed."
+    fi
+
+    # Determine the path to the wt script
+    local wt_script="$0"
+    # Resolve to absolute path
+    if [[ ! "$wt_script" = /* ]]; then
+        wt_script="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    fi
+
+    # Add shell function to .zshrc if not present
+    local zshrc="$HOME/.zshrc"
+    local marker="# wt - Git Worktree Manager shell integration"
+
+    if grep -q "$marker" "$zshrc" 2>/dev/null; then
+        info "Shell integration already exists in ~/.zshrc"
+        info "To update, remove the wt block from ~/.zshrc and run setup again."
+    else
+        info "Adding shell integration to ~/.zshrc..."
+        cat >> "$zshrc" << SHELL_EOF
+
+# wt - Git Worktree Manager shell integration
+wt() {
+    local cmd="\${1:-}"
+    case "\$cmd" in
+        ls|cd|new)
+            local dir
+            dir="\$(command $wt_script "\$@")"
+            if [[ -n "\$dir" && -d "\$dir" ]]; then
+                cd "\$dir"
+            fi
+            ;;
+        *)
+            command $wt_script "\$@"
+            ;;
+    esac
+}
+SHELL_EOF
+        info "Added wt shell function."
+    fi
+
+    info ""
+    info "Setup complete! Run 'source ~/.zshrc' to activate."
+    info ""
+    info "Usage:"
+    info "  wt ls            - List worktrees and navigate to selection"
+    info "  wt cd <name>     - Navigate to a worktree by name"
+    info "  wt new <name>    - Create a new worktree and navigate to it"
+    info "  wt rm <name>     - Remove a worktree"
+    info "  wt help          - Show all commands"
+}
+
+# ------------------------------------------------------------------------------
 # Command: help
 # ------------------------------------------------------------------------------
 cmd_help() {
@@ -258,7 +410,7 @@ USAGE:
     wt <command> [args]
 
 COMMANDS:
-    new <name>    Create a new worktree and branch from origin/main
+    new <name>    Create a new worktree and navigate to it
                   - Fetches origin/main
                   - Creates branch <name> from origin/main
                   - Creates worktree at ../<repo>-worktrees/<name>
@@ -270,19 +422,21 @@ COMMANDS:
                   - Deletes the local branch
                   - Never touches remote branches
 
-    ls            List all worktrees
+    ls            List all worktrees interactively and navigate to selection
 
-    prune         Prune stale worktree metadata
+    cd <name>     Navigate to a worktree by name
 
-    cd <name>     Print the path to a worktree
-                  Usage: cd "$(wt cd <name>)" or just: wtcd <name>
+    prune         Remove all worktrees (keeps only main repo)
+
+    setup         Install dependencies (fzf) and add shell integration
 
     help          Show this help message
 
 EXAMPLES:
-    wt new feature-auth     # Create new worktree for feature-auth
-    wt ls                   # List all worktrees
-    wtcd feature-auth       # Navigate to the worktree
+    wt setup                # First time setup (run once)
+    wt new feature-auth     # Create new worktree and cd into it
+    wt ls                   # Pick a worktree and cd into it
+    wt cd feature-auth      # Navigate to a worktree
     wt rm feature-auth      # Remove the worktree when done
 EOF
 }
@@ -294,7 +448,7 @@ main() {
     # Validate we're in a git repo (except for help)
     local command="${1:-help}"
 
-    if [[ "$command" != "help" && "$command" != "--help" && "$command" != "-h" ]]; then
+    if [[ "$command" != "help" && "$command" != "--help" && "$command" != "-h" && "$command" != "setup" ]]; then
         validate_git_repo
     fi
 
@@ -314,6 +468,9 @@ main() {
             ;;
         cd)
             cmd_cd "${2:-}"
+            ;;
+        setup)
+            cmd_setup
             ;;
         help|--help|-h)
             cmd_help
