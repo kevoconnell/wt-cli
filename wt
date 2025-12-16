@@ -1,0 +1,328 @@
+#!/usr/bin/env zsh
+# ==============================================================================
+# wt - Git Worktree Manager
+# ==============================================================================
+# A simple CLI for managing git worktrees in a structured workflow.
+# Worktrees are stored in ../<repo-name>-worktrees/<name> relative to the repo.
+#
+# Usage: wt <command> [args]
+#
+# Commands:
+#   new <name>   Create a new worktree and branch from origin/main
+#   rm <name>    Remove a worktree and its local branch
+#   ls           List all worktrees
+#   prune        Prune stale worktree metadata
+#   cd <name>    Print the path to a worktree (use with: cd "$(wt cd name)")
+#   help         Show this help message
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Script settings - fail fast on errors
+# ------------------------------------------------------------------------------
+set -e  # Exit on error
+set -u  # Error on undefined variables
+
+# ------------------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------------------
+readonly BASE_BRANCH="origin/main"   # Branch to base new worktrees on
+readonly WT_DIR_SUFFIX="-worktrees"  # Suffix for worktrees directory (e.g., repo-worktrees)
+
+# ------------------------------------------------------------------------------
+# Helper Functions
+# ------------------------------------------------------------------------------
+
+# Print an error message and exit with status 1
+die() {
+    echo "error: $1" >&2
+    exit 1
+}
+
+# Print an info message to stderr (so it doesn't interfere with stdout for cd)
+info() {
+    echo "$1" >&2
+}
+
+# Check if we're inside a git repository
+validate_git_repo() {
+    if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+        die "not a git repository (or any of the parent directories)"
+    fi
+}
+
+# Get the root directory of the current git repository
+get_repo_root() {
+    git rev-parse --show-toplevel
+}
+
+# Get the base directory where worktrees are stored (../<repo-name>-worktrees)
+get_wt_base() {
+    local repo_root="$1"
+    local repo_name="${repo_root:t}"
+    echo "${repo_root:h}/${repo_name}${WT_DIR_SUFFIX}"
+}
+
+# Validate that a worktree name is provided and valid
+validate_name() {
+    local name="$1"
+
+    if [[ -z "$name" ]]; then
+        die "worktree name is required"
+    fi
+
+    # Check for invalid characters (basic validation)
+    if [[ "$name" =~ [[:space:]] ]]; then
+        die "worktree name cannot contain spaces"
+    fi
+
+    if [[ "$name" == "." || "$name" == ".." ]]; then
+        die "invalid worktree name: $name"
+    fi
+}
+
+# Check if a local branch exists
+branch_exists() {
+    git show-ref --verify --quiet "refs/heads/$1" 2>/dev/null
+}
+
+# ------------------------------------------------------------------------------
+# Command: new
+# ------------------------------------------------------------------------------
+# Create a new worktree with a branch based on origin/main
+cmd_new() {
+    local name="${1:-}"
+    validate_name "$name"
+
+    local repo_root
+    repo_root="$(get_repo_root)"
+
+    local wt_base
+    wt_base="$(get_wt_base "$repo_root")"
+
+    local target_path="${wt_base}/${name}"
+
+    # Check if worktree directory already exists
+    if [[ -d "$target_path" ]]; then
+        die "worktree already exists at: $target_path"
+    fi
+
+    # Check if branch already exists
+    if branch_exists "$name"; then
+        die "branch '$name' already exists"
+    fi
+
+    # Fetch latest from origin to ensure we have up-to-date main
+    info "Fetching from origin..."
+    git fetch origin main
+
+    # Create the worktree base directory if it doesn't exist
+    mkdir -p "$wt_base"
+
+    # Create the worktree with a new branch
+    info "Creating worktree at: $target_path"
+    git worktree add -b "$name" "$target_path" "$BASE_BRANCH"
+
+    # Copy .env if it exists in repo root and not in target
+    local env_source="${repo_root}/.env"
+    local env_target="${target_path}/.env"
+
+    if [[ -f "$env_source" && ! -f "$env_target" ]]; then
+        info "Copying .env to worktree..."
+        cp "$env_source" "$env_target"
+    fi
+
+    # Open in VS Code if available
+    if command -v code &>/dev/null; then
+        info "Opening in VS Code..."
+        code "$target_path"
+    fi
+
+    # Print the path for the user to cd into
+    info ""
+    info "Worktree created successfully!"
+    info "To navigate there, run:"
+    info "  cd \"$target_path\""
+
+    # Also print just the path to stdout for scripting: cd "$(wt new name)"
+    echo "$target_path"
+}
+
+# ------------------------------------------------------------------------------
+# Command: rm
+# ------------------------------------------------------------------------------
+# Remove a worktree and its local branch
+cmd_rm() {
+    local name="${1:-}"
+    validate_name "$name"
+
+    local repo_root
+    repo_root="$(get_repo_root)"
+
+    local wt_base
+    wt_base="$(get_wt_base "$repo_root")"
+
+    local target_path="${wt_base}/${name}"
+
+    # Check if we're currently inside the worktree we're trying to delete
+    local current_dir
+    current_dir="$(pwd)"
+
+    # Resolve to absolute paths for comparison
+    local resolved_target
+    resolved_target="$(cd "$target_path" 2>/dev/null && pwd)" || resolved_target=""
+
+    if [[ -n "$resolved_target" && "$current_dir" == "$resolved_target"* ]]; then
+        die "cannot remove worktree while inside it. Please cd elsewhere first."
+    fi
+
+    # Check if worktree exists
+    if [[ ! -d "$target_path" ]]; then
+        die "worktree not found at: $target_path"
+    fi
+
+    # Remove the worktree
+    info "Removing worktree at: $target_path"
+    git worktree remove "$target_path"
+
+    # Try to delete the local branch
+    if branch_exists "$name"; then
+        info "Deleting local branch: $name"
+
+        # Try safe delete first (-d), fall back to force delete (-D) if unmerged
+        if ! git branch -d "$name" 2>/dev/null; then
+            info "Warning: branch has unmerged changes, force deleting..."
+            git branch -D "$name"
+        fi
+    fi
+
+    # Prune any stale worktree metadata
+    git worktree prune
+
+    info "Worktree '$name' removed successfully."
+}
+
+# ------------------------------------------------------------------------------
+# Command: ls
+# ------------------------------------------------------------------------------
+# List all worktrees
+cmd_ls() {
+    git worktree list
+}
+
+# ------------------------------------------------------------------------------
+# Command: prune
+# ------------------------------------------------------------------------------
+# Prune stale worktree metadata
+cmd_prune() {
+    info "Pruning stale worktree metadata..."
+    git worktree prune --verbose
+    info "Done."
+}
+
+# ------------------------------------------------------------------------------
+# Command: cd
+# ------------------------------------------------------------------------------
+# Print the absolute path to a worktree (for use with cd "$(wt cd name)")
+cmd_cd() {
+    local name="${1:-}"
+    validate_name "$name"
+
+    local repo_root
+    repo_root="$(get_repo_root)"
+
+    local wt_base
+    wt_base="$(get_wt_base "$repo_root")"
+
+    local target_path="${wt_base}/${name}"
+
+    # Check if worktree exists
+    if [[ ! -d "$target_path" ]]; then
+        die "worktree not found at: $target_path"
+    fi
+
+    # Print absolute path to stdout
+    echo "$target_path"
+}
+
+# ------------------------------------------------------------------------------
+# Command: help
+# ------------------------------------------------------------------------------
+cmd_help() {
+    cat << 'EOF'
+wt - Git Worktree Manager
+
+A simple CLI for managing git worktrees. Worktrees are stored in
+../<repo-name>-worktrees/<name> relative to your repository.
+
+USAGE:
+    wt <command> [args]
+
+COMMANDS:
+    new <name>    Create a new worktree and branch from origin/main
+                  - Fetches origin/main
+                  - Creates branch <name> from origin/main
+                  - Creates worktree at ../<repo>-worktrees/<name>
+                  - Copies .env if it exists
+                  - Opens in VS Code if available
+
+    rm <name>     Remove a worktree and its local branch
+                  - Safely removes the worktree
+                  - Deletes the local branch
+                  - Never touches remote branches
+
+    ls            List all worktrees
+
+    prune         Prune stale worktree metadata
+
+    cd <name>     Print the path to a worktree
+                  Usage: cd "$(wt cd <name>)" or just: wtcd <name>
+
+    help          Show this help message
+
+EXAMPLES:
+    wt new feature-auth     # Create new worktree for feature-auth
+    wt ls                   # List all worktrees
+    wtcd feature-auth       # Navigate to the worktree
+    wt rm feature-auth      # Remove the worktree when done
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# Main Dispatch
+# ------------------------------------------------------------------------------
+main() {
+    # Validate we're in a git repo (except for help)
+    local command="${1:-help}"
+
+    if [[ "$command" != "help" && "$command" != "--help" && "$command" != "-h" ]]; then
+        validate_git_repo
+    fi
+
+    # Dispatch to the appropriate command
+    case "$command" in
+        new)
+            cmd_new "${2:-}"
+            ;;
+        rm|remove)
+            cmd_rm "${2:-}"
+            ;;
+        ls|list)
+            cmd_ls
+            ;;
+        prune)
+            cmd_prune
+            ;;
+        cd)
+            cmd_cd "${2:-}"
+            ;;
+        help|--help|-h)
+            cmd_help
+            ;;
+        *)
+            die "unknown command: $command. Run 'wt help' for usage."
+            ;;
+    esac
+}
+
+# Run main with all arguments
+main "$@"
