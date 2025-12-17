@@ -289,7 +289,7 @@ cmd_prune() {
         branch_name=$(git worktree list --porcelain | grep -A2 "worktree $wt_path$" | grep "^branch " | sed 's/^branch refs\/heads\///')
 
         info "Removing worktree: $wt_name"
-        git worktree remove "$wt_path" --force 2>/dev/null || true
+        git worktree remove --force "$wt_path" 2>/dev/null || true
 
         # Try to delete the local branch using the actual branch name
         if [[ -n "$branch_name" ]] && branch_exists "$branch_name"; then
